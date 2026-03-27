@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="../ECSEngineBenchmark/ECSEngineBenchmark.csproj" />
+  <Project Path="ECSEngine.csproj" />
+</Solution>

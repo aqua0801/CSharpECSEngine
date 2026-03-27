@@ -1,0 +1,18 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+	<PackageId>ECSEngine</PackageId>
+	<Version>0.1.0</Version>
+	<Authors>Aqua0801</Authors>
+	<Description>A lightweight ECS engine for .NET</Description>
+
+	<RepositoryUrl>https://github.com/aqua0801/CSharpECSEngine</RepositoryUrl>
+	  
+	  
+  </PropertyGroup>
+	
+</Project>
