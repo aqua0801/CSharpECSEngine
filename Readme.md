@@ -4,6 +4,8 @@ A lightweight, high-performance Entity Component System for .NET 10+.
 
 Built around a **sparse set** architecture with zero heap allocation in the hot path, fluent query API, and deferred structural changes via command buffers.
 
+[![NuGet](https://img.shields.io/nuget/v/ECSEngine.svg)](https://www.nuget.org/packages/ECSEngine)
+
 ---
 
 
