@@ -2,10 +2,9 @@
 
 A lightweight, high-performance Entity Component System for .NET 10+.
 
-Built around a **sparse set** architecture with zero heap allocation in the hot path, fluent query API, and deferred structural changes via command buffers.
+Built around a **sparse set** architecture with **bitset-accelerated queries**, zero heap allocation in the hot path, fluent query API, and deferred structural changes via command buffers.
 
 ---
-
 
 ## Quick Start
 
@@ -96,7 +95,7 @@ reg.GetQueryBuilder()
 
 ### Multi-component intersection
 
-The engine automatically iterates the smallest pool to minimise work:
+For queries with two or more components, the engine resolves matching entities using **bitset AND** across component pools — 64 entities are evaluated per CPU instruction. The engine then iterates only confirmed matches:
 
 ```csharp
 reg.GetQueryBuilder()
@@ -127,7 +126,7 @@ reg.GetQueryBuilder()
    });
 ```
 
-Up to **4 Without filters** are supported. Filters are resolved at query-build time — there is no per-iteration dictionary lookup.
+Without filters are applied as **bitset AND NOT** at the word level — excluded entities are eliminated 64 at a time before any per-entity work is done. Up to **4 Without filters** are supported. Filters are resolved at query-build time with no per-iteration dictionary lookup.
 
 ---
 
@@ -177,9 +176,26 @@ registry.PublishCommands();
 
 ---
 
-## Zero-overhead Queries with ExecuteInline
+## Query Execution Modes
 
-By default, `Execute` uses a delegate, which incurs one indirect call per iteration. For performance-critical systems, use `ExecuteInline` with a struct implementing `IEcsAction<T...>`:
+There are three execution modes. Choose based on your performance requirements:
+
+### `Execute` — delegate
+
+Convenience method for prototyping or one-off logic. Incurs one delegate indirect call per entity.
+
+```csharp
+reg.GetQueryBuilder()
+   .With<Position>()
+   .Execute(ctx, (id, ref Position pos, EcsContext c) =>
+   {
+       pos.X += 1f * c.DeltaTime;
+   });
+```
+
+### `ExecuteInline` — zero overhead, single-threaded
+
+For hot paths executed every frame. Implement `IEcsAction<T...>` as a struct. The JIT specialises the iteration loop per `TAction`, eliminating all virtual dispatch:
 
 ```csharp
 struct MoveAction : IEcsAction<Position, Velocity>
@@ -197,7 +213,40 @@ reg.GetQueryBuilder()
    .ExecuteInline(ctx, new MoveAction());
 ```
 
-The JIT specialises the iteration loop for each `TAction` struct, eliminating all virtual dispatch.
+### `ExecuteParallel` — zero overhead, multi-threaded
+
+For large entity counts where per-frame work is independent across entities. Implement `IEcsParallelAction<T...>` as a struct. The action receives a `ParallelEcsContext` instead of `EcsContext` — direct registry access is intentionally removed to prevent data races. Use `PostCommand` for any structural changes:
+
+```csharp
+struct VelocityAction : IEcsParallelAction<Position, Velocity>
+{
+    public void Execute(int id, ref Position pos, ref Velocity vel, ParallelEcsContext ctx)
+    {
+        pos.X += vel.X * vel.Speed * ctx.DeltaTime;
+        pos.Y += vel.Y * vel.Speed * ctx.DeltaTime;
+
+        if (pos.X < 0) { pos.X = 0; vel.X = MathF.Abs(vel.X); }
+        if (pos.X > 1000) { pos.X = 1000; vel.X = -MathF.Abs(vel.X); }
+    }
+}
+
+reg.GetQueryBuilder()
+   .Without<Dead>()
+   .With<Position>()
+   .With<Velocity>()
+   .ExecuteParallel(ctx, new VelocityAction());
+```
+
+`Without` filters compose with `ExecuteParallel` identically to `Execute` and `ExecuteInline` — place them before `With` in the builder chain as normal.
+
+`ParallelEcsContext` exposes the same `DeltaTime`, `FrameCount`, and `PostCommand` as `EcsContext`, but does not expose `Registry` directly. `PostCommand` is thread-safe.
+
+| | `Execute` | `ExecuteInline` | `ExecuteParallel` |
+|---|---|---|---|
+| Dispatch overhead | delegate | none | none |
+| Threading | single | single | multi |
+| Context type | `EcsContext` | `EcsContext` | `ParallelEcsContext` |
+| Structural changes | `PostCommand` | `PostCommand` | `PostCommand` |
 
 ---
 
@@ -221,7 +270,6 @@ public static class MyQueryExtensions
         var p4 = reg.GetPoolUnsafe<T4>();
         var p5 = reg.GetPoolUnsafe<T5>();
 
-        // iterate smallest pool, check intersection
         foreach (int id in p1.ActiveEntities)
             if (p2.Has(id) && p3.Has(id) && p4.Has(id) && p5.Has(id))
                 action(id, ref p1.Get(id), ref p2.Get(id),
@@ -245,7 +293,7 @@ var physicsLoop = new Scheduler(registry).Add(PhysicsSystem);
 while (running)
 {
     gameLoop.Tick(deltaTime);
-    physicsLoop.TickFixed(1f / 60f);  // if you implement TickFixed
+    physicsLoop.Tick(1f / 60f);
 }
 ```
 
@@ -275,11 +323,13 @@ using var (registry, scheduler) = EcsRegistry.Create(reg => { ... });
 | Concern | Decision |
 |---|---|
 | Component storage | Sparse set — O(1) add/remove/lookup, cache-friendly iteration |
-| Thread safety | Single-threaded by design. Structural changes must be deferred via `PostCommand` |
+| Query intersection | Bitset AND across pools — 64 entities evaluated per instruction |
+| Without filtering | Bitset AND NOT at word level — no per-entity virtual dispatch |
+| Thread safety | Structural changes must be deferred via `PostCommand`. `ExecuteParallel` enforces this via `ParallelEcsContext` |
 | Query arity limit | 4 built-in, extensible via `GetPoolUnsafe` |
 | Without filter limit | 4 per query |
 | Entity ID recycling | Retired IDs are reused via an internal queue |
-| Pool resizing | Doubling strategy using `ArrayPool<T>`, separately for sparse and dense arrays |
+| Pool resizing | Doubling strategy using `ArrayPool<T>`, separately for sparse, dense, and bitset arrays |
 
 ---
 

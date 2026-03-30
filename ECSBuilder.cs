@@ -1,4 +1,6 @@
-﻿using System.Runtime.CompilerServices;
+﻿using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace ECSEngine
 {
@@ -22,17 +24,33 @@ namespace ECSEngine
     {
         void Execute(int entityId, ref T1 c1, EcsContext ctx);
     }
+    public interface IEcsParallelAction<T1>
+    {
+        void Execute(int entityId, ref T1 c1, ParallelEcsContext ctx);
+    }
     public interface IEcsAction<T1, T2>
     {
         void Execute(int entityId, ref T1 c1, ref T2 c2, EcsContext ctx);
+    }
+    public interface IEcsParallelAction<T1, T2>
+    {
+        void Execute(int entityId, ref T1 c1, ref T2 c2, ParallelEcsContext ctx);
     }
     public interface IEcsAction<T1, T2, T3>
     {
         void Execute(int entityId, ref T1 c1, ref T2 c2, ref T3 c3, EcsContext ctx);
     }
+    public interface IEcsParallelAction<T1, T2, T3>
+    {
+        void Execute(int entityId, ref T1 c1, ref T2 c2, ref T3 p3, ParallelEcsContext ctx);
+    }
     public interface IEcsAction<T1, T2, T3, T4>
     {
         void Execute(int entityId, ref T1 c1, ref T2 c2, ref T3 c3, ref T4 c4, EcsContext ctx);
+    }
+    public interface IEcsParallelAction<T1, T2, T3, T4>
+    {
+        void Execute(int entityId, ref T1 c1, ref T2 c2, ref T3 p3, ref T4 p4, ParallelEcsContext ctx);
     }
 
     public partial class EcsRegistry
@@ -50,6 +68,9 @@ namespace ECSEngine
             private IComponentPool _element;
         }
 
+        [InlineArray(4)]
+        internal struct BitsetBuffer4 { private ulong[] _element; }
+
         /// <summary>
         /// Provides a builder for constructing entity queries with optional component exclusion in an ECS registry.
         /// </summary>
@@ -61,16 +82,22 @@ namespace ECSEngine
         {
             private readonly EcsRegistry _reg;
             private PoolBuffer4 _withoutPools;
+            private BitsetBuffer4 _withoutBitsets;
             private int _withoutCount;
             internal QueryBuilder(EcsRegistry reg) => _reg = reg;
 
             public Query<T1> With<T1>() where T1 : struct
-                => new Query<T1>(_reg, _withoutPools, _withoutCount);
+                => new Query<T1>(_reg, _withoutBitsets, _withoutCount);
 
             public QueryBuilder Without<T>() where T : struct
             {
                 if (_withoutCount < 4)
-                    _withoutPools[_withoutCount++] = _reg.GetPool<T>();
+                {
+                    var pool = _reg.GetPool<T>();
+                    _withoutPools[_withoutCount] = pool;
+                    _withoutBitsets[_withoutCount] = pool.BitsetArray;
+                    _withoutCount++;
+                }
                 return this;
             }
         }
@@ -86,17 +113,17 @@ namespace ECSEngine
         public struct Query<T1> where T1 : struct
         {
             private readonly EcsRegistry _reg;
-            private PoolBuffer4 _withoutPools;
+            private BitsetBuffer4 _withoutBitsets;
             private int _withoutCount;
-            internal Query(EcsRegistry reg, PoolBuffer4 withoutBuf, int withoutCount)
+            internal Query(EcsRegistry reg, BitsetBuffer4 withoutBitsets, int withoutCount)
             {
                 _reg = reg;
-                _withoutPools = withoutBuf;
+                _withoutBitsets = withoutBitsets;
                 _withoutCount = withoutCount;
             }
 
             public Query<T1, T2> With<T2>() where T2 : struct
-                => new Query<T1, T2>(_reg, _withoutPools, _withoutCount);
+                => new Query<T1, T2>(_reg, _withoutBitsets, _withoutCount);
 
             /// <summary>
             /// Executes the specified action for each active entity of type T1 that passes the filter within the given
@@ -105,10 +132,16 @@ namespace ECSEngine
             public void Execute(EcsContext ctx, EcsActions.EcsAction<T1> action)
             {
                 var pool = _reg.GetPool<T1>();
-                foreach (int id in pool.ActiveEntities)
+
+                var entities = pool.ActiveEntities;
+                int count = entities.Length;
+                ref int entityRef = ref MemoryMarshal.GetReference(entities);
+
+                for (int i = 0; i < count; i++)
                 {
+                    int id = Unsafe.Add(ref entityRef, i);
                     if (PassesFilter(id))
-                        action(id, ref pool.Get(id) , ctx);
+                        action(id, ref pool.Get(id), ctx);
                 }
             }
             
@@ -119,17 +152,71 @@ namespace ECSEngine
                 where TAction : struct , IEcsAction<T1>
             {
                 var pool = _reg.GetPool<T1>();
-                foreach (int id in pool.ActiveEntities)
+
+                var entities = pool.ActiveEntities;
+                int count = entities.Length;
+                ref int entityRef = ref MemoryMarshal.GetReference(entities);
+
+                for (int i = 0; i < count; i++)
                 {
-                    if(PassesFilter(id))
+                    int id = Unsafe.Add(ref entityRef, i);
+                    if (PassesFilter(id))
                         action.Execute(id, ref pool.Get(id), ctx);
                 }
             }
 
+            public void ExecuteParallel<TAction>(EcsContext ctx, TAction action)
+                where TAction : struct, IEcsParallelAction<T1>
+            {
+                var pctx = ctx.AsParallel();
+                var pool = _reg.GetPool<T1>();
+
+                int[] entities = pool.DenseEntities;
+                int count = pool.Count;
+                int chunkSize = Math.Max(64 / Unsafe.SizeOf<T1>(), 1);
+
+                var withoutBitsets = _withoutBitsets;
+                int withoutCount = _withoutCount;
+
+                Parallel.For(0, (count + chunkSize - 1) / chunkSize, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int end = Math.Min(start + chunkSize, count);
+                    for (int i = start; i < end; i++)
+                    {
+                        int id = entities[i];
+
+                        int word = id >> 6;
+                        ulong bit = 1UL << (id & 63);
+                        bool passes = true;
+                        for (int j = 0; j < withoutCount; j++)
+                        {
+                            var bs = withoutBitsets[j];
+                            if ((uint)word < (uint)bs.Length && (bs[word] & bit) != 0)
+                            {
+                                passes = false;
+                                break;
+                            }
+                        }
+
+                        if (passes)
+                            action.Execute(id, ref pool.Get(id), pctx);
+                    }
+                });
+            }
+
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
             private bool PassesFilter(int id)
             {
+                int word = id >> 6;
+                ulong bit = 1UL << (id & 63);
                 for (int i = 0; i < _withoutCount; i++)
-                    if (_withoutPools[i].Has(id)) return false;
+                {
+                    var bs = _withoutBitsets[i];
+                    if ((uint)word < (uint)bs.Length && (bs[word] & bit) != 0)
+                        return false;
+                }
                 return true;
             }
         }
@@ -137,32 +224,46 @@ namespace ECSEngine
         public struct Query<T1, T2> where T1 : struct where T2 : struct
         {
             private readonly EcsRegistry _reg;
-            private PoolBuffer4 _withoutPools;
+            private BitsetBuffer4 _withoutBitsets;
             private int _withoutCount;
-            internal Query(EcsRegistry reg, PoolBuffer4 withoutBuf, int withoutCount)
+            internal Query(EcsRegistry reg, BitsetBuffer4 withoutBitsets, int withoutCount)
             {
                 _reg = reg;
-                _withoutPools = withoutBuf;
+                _withoutBitsets = withoutBitsets;
                 _withoutCount = withoutCount;
             }
 
             public Query<T1, T2, T3> With<T3>() where T3 : struct
-                => new Query<T1, T2, T3>(_reg, _withoutPools, _withoutCount);
+                => new Query<T1, T2, T3>(_reg, _withoutBitsets, _withoutCount);
 
             public void Execute(EcsContext ctx, EcsActions.EcsAction<T1, T2> action)
             {
                 var p1 = _reg.GetPool<T1>();
                 var p2 = _reg.GetPool<T2>();
 
-                if (p1.Count <= p2.Count)
+                ulong[] bs1 = p1.BitsetArray;
+                ulong[] bs2 = p2.BitsetArray;
+                int words = Math.Min(p1.BitsetWordCount, p2.BitsetWordCount);
+
+                for (int w = 0; w < words; w++)
                 {
-                    foreach (int id in p1.ActiveEntities)
-                        if (p2.HasUnsafe(id) && PassesFilter(id)) action(id, ref p1.Get(id), ref p2.Get(id) , ctx);
-                }
-                else
-                {
-                    foreach (int id in p2.ActiveEntities)
-                        if (p1.HasUnsafe(id) && PassesFilter(id)) action(id, ref p1.Get(id), ref p2.Get(id) , ctx);
+                    ulong mask = bs1[w] & bs2[w];
+                    if (mask == 0) continue;
+
+                    for (int i = 0; i < _withoutCount; i++)
+                    {
+                        var wbs = _withoutBitsets[i];
+                        if ((uint)w < (uint)wbs.Length)
+                            mask &= ~wbs[w];
+                    }
+
+                    while (mask != 0)
+                    {
+                        int bit = BitOperations.TrailingZeroCount(mask);
+                        int id = (w << 6) | bit;
+                        action(id, ref p1.Get(id), ref p2.Get(id), ctx);
+                        mask &= mask - 1; 
+                    }
                 }
             }
 
@@ -172,40 +273,84 @@ namespace ECSEngine
                 var p1 = _reg.GetPool<T1>();
                 var p2 = _reg.GetPool<T2>();
 
-                if (p1.Count <= p2.Count)
+                ulong[] bs1 = p1.BitsetArray;
+                ulong[] bs2 = p2.BitsetArray;
+                int words = Math.Min(p1.BitsetWordCount, p2.BitsetWordCount);
+
+                for (int w = 0; w < words; w++)
                 {
-                    foreach (int id in p1.ActiveEntities)
-                        if (p2.HasUnsafe(id) && PassesFilter(id)) action.Execute(id, ref p1.Get(id), ref p2.Get(id), ctx);
-                }
-                else
-                {
-                    foreach (int id in p2.ActiveEntities)
-                        if (p1.HasUnsafe(id) && PassesFilter(id)) action.Execute(id, ref p1.Get(id), ref p2.Get(id), ctx);
+                    ulong mask = bs1[w] & bs2[w];
+                    if (mask == 0) continue;
+
+                    for (int i = 0; i < _withoutCount; i++)
+                    {
+                        var wbs = _withoutBitsets[i];
+                        if ((uint)w < (uint)wbs.Length)
+                            mask &= ~wbs[w];
+                    }
+
+                    while (mask != 0)
+                    {
+                        int bit = BitOperations.TrailingZeroCount(mask);
+                        int id = (w << 6) | bit;
+                        action.Execute(id, ref p1.Get(id), ref p2.Get(id), ctx);
+                        mask &= mask - 1;
+                    }
                 }
             }
 
-            private bool PassesFilter(int id)
+            public void ExecuteParallel<TAction>(EcsContext ctx, TAction action)
+                where TAction : struct, IEcsParallelAction<T1, T2>
             {
-                for (int i = 0; i < _withoutCount; i++)
-                    if (_withoutPools[i].Has(id)) return false;
-                return true;
+                var p1 = _reg.GetPool<T1>();
+                var p2 = _reg.GetPool<T2>();
+                var pctx = ctx.AsParallel();
+
+                ulong[] bs1 = p1.BitsetArray;
+                ulong[] bs2 = p2.BitsetArray;
+                int words = Math.Min(p1.BitsetWordCount, p2.BitsetWordCount);
+
+                var withoutBitsets = _withoutBitsets;
+                int withoutCount = _withoutCount;
+
+                Parallel.For(0, words, w =>
+                {
+                    ulong mask = bs1[w] & bs2[w];
+                    if (mask == 0) return;
+
+                    for (int i = 0; i < withoutCount; i++)
+                    {
+                        var wbs = withoutBitsets[i];
+                        if ((uint)w < (uint)wbs.Length)
+                            mask &= ~wbs[w];
+                    }
+                    if (mask == 0) return;
+
+                    while (mask != 0)
+                    {
+                        int bit = BitOperations.TrailingZeroCount(mask);
+                        int id = (w << 6) | bit;
+                        action.Execute(id, ref p1.Get(id), ref p2.Get(id), pctx);
+                        mask &= mask - 1;
+                    }
+                });
             }
         }
 
         public struct Query<T1, T2, T3> where T1 : struct where T2 : struct where T3 : struct
         {
             private readonly EcsRegistry _reg;
-            private PoolBuffer4 _withoutPools;
+            private BitsetBuffer4 _withoutBitsets;
             private int _withoutCount;
-            internal Query(EcsRegistry reg, PoolBuffer4 withoutBuf, int withoutCount)
+            internal Query(EcsRegistry reg, BitsetBuffer4 withoutBitsets, int withoutCount)
             {
                 _reg = reg;
-                _withoutPools = withoutBuf;
+                _withoutBitsets = withoutBitsets;
                 _withoutCount = withoutCount;
             }
 
             public Query<T1, T2, T3, T4> With<T4>() where T4 : struct
-                => new Query<T1, T2, T3, T4>(_reg, _withoutPools, _withoutCount);
+                => new Query<T1, T2, T3, T4>(_reg, _withoutBitsets, _withoutCount);
 
             public void Execute(EcsContext ctx, EcsActions.EcsAction<T1, T2, T3> action)
             {
@@ -213,17 +358,30 @@ namespace ECSEngine
                 var p2 = _reg.GetPool<T2>();
                 var p3 = _reg.GetPool<T3>();
 
-                var entities = MinIndex(p1.Count, p2.Count, p3.Count) switch
-                {
-                    0 => p1.ActiveEntities,
-                    1 => p2.ActiveEntities,
-                    _ => p3.ActiveEntities,
-                };
+                ulong[] bs1 = p1.BitsetArray;
+                ulong[] bs2 = p2.BitsetArray;
+                ulong[] bs3 = p3.BitsetArray;
+                int words = Min(p1.BitsetWordCount, p2.BitsetWordCount, p3.BitsetWordCount);
 
-                foreach (int id in entities)
+                for (int w = 0; w < words; w++)
                 {
-                    if (p1.HasUnsafe(id) && p2.HasUnsafe(id) && p3.HasUnsafe(id) && PassesFilter(id))
+                    ulong mask = bs1[w] & bs2[w] & bs3[w];
+                    if (mask == 0) continue;
+
+                    for (int i = 0; i < _withoutCount; i++)
+                    {
+                        var wbs = _withoutBitsets[i];
+                        if ((uint)w < (uint)wbs.Length)
+                            mask &= ~wbs[w];
+                    }
+
+                    while (mask != 0)
+                    {
+                        int bit = BitOperations.TrailingZeroCount(mask);
+                        int id = (w << 6) | bit;
                         action(id, ref p1.Get(id), ref p2.Get(id), ref p3.Get(id), ctx);
+                        mask &= mask - 1;
+                    }
                 }
             }
 
@@ -234,37 +392,82 @@ namespace ECSEngine
                 var p2 = _reg.GetPool<T2>();
                 var p3 = _reg.GetPool<T3>();
 
-                var entities = MinIndex(p1.Count, p2.Count, p3.Count) switch
-                {
-                    0 => p1.ActiveEntities,
-                    1 => p2.ActiveEntities,
-                    _ => p3.ActiveEntities,
-                };
+                ulong[] bs1 = p1.BitsetArray;
+                ulong[] bs2 = p2.BitsetArray;
+                ulong[] bs3 = p3.BitsetArray;
+                int words = Min(p1.BitsetWordCount, p2.BitsetWordCount, p3.BitsetWordCount);
 
-                foreach (int id in entities)
+                for (int w = 0; w < words; w++)
                 {
-                    if (p1.HasUnsafe(id) && p2.HasUnsafe(id) && p3.HasUnsafe(id) && PassesFilter(id))
+                    ulong mask = bs1[w] & bs2[w] & bs3[w];
+                    if (mask == 0) continue;
+
+                    for (int i = 0; i < _withoutCount; i++)
+                    {
+                        var wbs = _withoutBitsets[i];
+                        if ((uint)w < (uint)wbs.Length)
+                            mask &= ~wbs[w];
+                    }
+
+                    while (mask != 0)
+                    {
+                        int bit = BitOperations.TrailingZeroCount(mask);
+                        int id = (w << 6) | bit;
                         action.Execute(id, ref p1.Get(id), ref p2.Get(id), ref p3.Get(id), ctx);
+                        mask &= mask - 1;
+                    }
                 }
             }
 
-            private bool PassesFilter(int id)
+            public void ExecuteParallel<TAction>(EcsContext ctx, TAction action)
+                where TAction : struct, IEcsParallelAction<T1, T2, T3>
             {
-                for (int i = 0; i < _withoutCount; i++)
-                    if (_withoutPools[i].Has(id)) return false;
-                return true;
+                var p1 = _reg.GetPool<T1>();
+                var p2 = _reg.GetPool<T2>();
+                var p3 = _reg.GetPool<T3>();
+                var pctx = ctx.AsParallel();
+
+                ulong[] bs1 = p1.BitsetArray;
+                ulong[] bs2 = p2.BitsetArray;
+                ulong[] bs3 = p3.BitsetArray;
+                int words = Min(p1.BitsetWordCount, p2.BitsetWordCount, p3.BitsetWordCount);
+
+                var withoutBitsets = _withoutBitsets;
+                int withoutCount = _withoutCount;
+
+                Parallel.For(0, words, w =>
+                {
+                    ulong mask = bs1[w] & bs2[w] & bs3[w];
+                    if (mask == 0) return;
+
+                    for (int i = 0; i < withoutCount; i++)
+                    {
+                        var wbs = withoutBitsets[i];
+                        if ((uint)w < (uint)wbs.Length)
+                            mask &= ~wbs[w];
+                    }
+                    if (mask == 0) return;
+
+                    while (mask != 0)
+                    {
+                        int bit = BitOperations.TrailingZeroCount(mask);
+                        int id = (w << 6) | bit;
+                        action.Execute(id, ref p1.Get(id), ref p2.Get(id), ref p3.Get(id), pctx);
+                        mask &= mask - 1;
+                    }
+                });
             }
         }
 
         public struct Query<T1, T2, T3, T4> where T1 : struct where T2 : struct where T3 : struct where T4 : struct
         {
             private readonly EcsRegistry _reg;
-            private PoolBuffer4 _withoutPools;
+            private BitsetBuffer4 _withoutBitsets;
             private int _withoutCount;
-            internal Query(EcsRegistry reg, PoolBuffer4 withoutBuf, int withoutCount)
+            internal Query(EcsRegistry reg, BitsetBuffer4 withoutBitsets, int withoutCount)
             {
                 _reg = reg;
-                _withoutPools = withoutBuf;
+                _withoutBitsets = withoutBitsets;
                 _withoutCount = withoutCount;
             }
 
@@ -275,18 +478,31 @@ namespace ECSEngine
                 var p3 = _reg.GetPool<T3>();
                 var p4 = _reg.GetPool<T4>();
 
-                var entities = MinIndex(p1.Count, p2.Count, p3.Count , p4.Count) switch
-                {
-                    0 => p1.ActiveEntities,
-                    1 => p2.ActiveEntities,
-                    2 => p3.ActiveEntities,
-                    _ => p4.ActiveEntities
-                };
+                ulong[] bs1 = p1.BitsetArray;
+                ulong[] bs2 = p2.BitsetArray;
+                ulong[] bs3 = p3.BitsetArray;
+                ulong[] bs4 = p4.BitsetArray;
+                int words = Min(p1.BitsetWordCount, p2.BitsetWordCount, p3.BitsetWordCount , p4.BitsetWordCount);
 
-                foreach (int id in entities)
+                for (int w = 0; w < words; w++)
                 {
-                    if (p1.HasUnsafe(id) && p2.HasUnsafe(id) && p3.HasUnsafe(id) && p4.HasUnsafe(id) && PassesFilter(id))
+                    ulong mask = bs1[w] & bs2[w] & bs3[w] & bs4[w];
+                    if (mask == 0) continue;
+
+                    for (int i = 0; i < _withoutCount; i++)
+                    {
+                        var wbs = _withoutBitsets[i];
+                        if ((uint)w < (uint)wbs.Length)
+                            mask &= ~wbs[w];
+                    }
+
+                    while (mask != 0)
+                    {
+                        int bit = BitOperations.TrailingZeroCount(mask);
+                        int id = (w << 6) | bit;
                         action(id, ref p1.Get(id), ref p2.Get(id), ref p3.Get(id), ref p4.Get(id), ctx);
+                        mask &= mask - 1;
+                    }
                 }
             }
 
@@ -298,37 +514,92 @@ namespace ECSEngine
                 var p3 = _reg.GetPool<T3>();
                 var p4 = _reg.GetPool<T4>();
 
-                var entities = MinIndex(p1.Count, p2.Count, p3.Count, p4.Count) switch
-                {
-                    0 => p1.ActiveEntities,
-                    1 => p2.ActiveEntities,
-                    2 => p3.ActiveEntities,
-                    _ => p4.ActiveEntities
-                };
+                ulong[] bs1 = p1.BitsetArray;
+                ulong[] bs2 = p2.BitsetArray;
+                ulong[] bs3 = p3.BitsetArray;
+                ulong[] bs4 = p4.BitsetArray;
+                int words = Min(p1.BitsetWordCount, p2.BitsetWordCount, p3.BitsetWordCount, p4.BitsetWordCount);
 
-                foreach (int id in entities)
+                for (int w = 0; w < words; w++)
                 {
-                    if (p1.HasUnsafe(id) && p2.HasUnsafe(id) && p3.HasUnsafe(id) && p4.HasUnsafe(id) && PassesFilter(id))
+                    ulong mask = bs1[w] & bs2[w] & bs3[w] & bs4[w];
+                    if (mask == 0) continue;
+
+                    for (int i = 0; i < _withoutCount; i++)
+                    {
+                        var wbs = _withoutBitsets[i];
+                        if ((uint)w < (uint)wbs.Length)
+                            mask &= ~wbs[w];
+                    }
+
+                    while (mask != 0)
+                    {
+                        int bit = BitOperations.TrailingZeroCount(mask);
+                        int id = (w << 6) | bit;
                         action.Execute(id, ref p1.Get(id), ref p2.Get(id), ref p3.Get(id), ref p4.Get(id), ctx);
+                        mask &= mask - 1;
+                    }
                 }
             }
-
-            private bool PassesFilter(int id)
+            public void ExecuteParallel<TAction>(EcsContext ctx, TAction action)
+                where TAction : struct, IEcsParallelAction<T1, T2, T3, T4>
             {
-                for (int i = 0; i < _withoutCount; i++)
-                    if (_withoutPools[i].Has(id)) return false;
-                return true;
+                var p1 = _reg.GetPool<T1>();
+                var p2 = _reg.GetPool<T2>();
+                var p3 = _reg.GetPool<T3>();
+                var p4 = _reg.GetPool<T4>();
+                var pctx = ctx.AsParallel();
+
+                ulong[] bs1 = p1.BitsetArray;
+                ulong[] bs2 = p2.BitsetArray;
+                ulong[] bs3 = p3.BitsetArray;
+                ulong[] bs4 = p4.BitsetArray;
+                int words = Min(p1.BitsetWordCount, p2.BitsetWordCount, p3.BitsetWordCount, p4.BitsetWordCount);
+
+                var withoutBitsets = _withoutBitsets;
+                int withoutCount = _withoutCount;
+
+                Parallel.For(0, words, w =>
+                {
+                    ulong mask = bs1[w] & bs2[w] & bs3[w] & bs4[w];
+                    if (mask == 0) return;
+
+                    for (int i = 0; i < withoutCount; i++)
+                    {
+                        var wbs = withoutBitsets[i];
+                        if ((uint)w < (uint)wbs.Length)
+                            mask &= ~wbs[w];
+                    }
+                    if (mask == 0) return;
+
+                    while (mask != 0)
+                    {
+                        int bit = BitOperations.TrailingZeroCount(mask);
+                        int id = (w << 6) | bit;
+                        action.Execute(id, ref p1.Get(id), ref p2.Get(id), ref p3.Get(id), ref p4.Get(id), pctx);
+                        mask &= mask - 1;
+                    }
+                });
             }
         }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int Min(int a, int b , int c) =>
+            a <= b ? (a <= c ? a : c) : (b <= c ? b : c);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int MinIndex(int a, int b, int c) =>
-            a <= b ? (a <= c ? 0 : 2) : (b <= c ? 1 : 2);
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int MinIndex(int a, int b, int c, int d) =>
-            a <= b && a <= c && a <= d ? 0 :
-            b <= c && b <= d ? 1 :
-            c <= d ? 2 : 3;
+        private static int Min(int a, int b, int c, int d) =>
+            a <= b && a <= c && a <= d ? a :
+            b <= c && b <= d ? b :
+            c <= d ? c : d;
+    }
+
+
+    public struct ParallelEcsContext
+    {
+        public float DeltaTime;
+        public long FrameCount;
+        internal EcsRegistry _reg;
+        public void PostCommand(Action<EcsRegistry> cmd) => _reg.PostCommand(cmd);
     }
 
     public static class QueryExtensions
@@ -366,9 +637,12 @@ namespace ECSEngine
                 3 => p4.ActiveEntities,
                 _ => p5.ActiveEntities
             };
+            int count = entities.Length;
+            ref int entityRef = ref MemoryMarshal.GetReference(entities);
 
-            foreach (int id in entities)
+            for (int i = 0; i < count; i++)
             {
+                int id = Unsafe.Add(ref entityRef, i);
                 if (p1.HasUnsafe(id) && p2.HasUnsafe(id) && p3.HasUnsafe(id) && p4.HasUnsafe(id) && p5.HasUnsafe(id))
                     action(id, ref p1.Get(id), ref p2.Get(id), ref p3.Get(id), ref p4.Get(id), ref p5.Get(id), ctx);
             }

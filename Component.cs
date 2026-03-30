@@ -12,6 +12,8 @@ namespace ECSEngine
         public bool Has(int entityId);
         void Remove(int entityId);
         int Count { get; }
+        ulong[] BitsetArray { get; }
+        int BitsetWordCount { get; }
     }
 
     /// <summary>
@@ -24,6 +26,10 @@ namespace ECSEngine
     /// <typeparam name="T">The value type of the component to be stored in the pool. Must be a struct.</typeparam>
     public class ComponentPool<T> : IComponentPool where T : struct
     {
+        private static readonly ArrayPool<ulong> _bitsetPool = ArrayPool<ulong>.Shared;
+
+        private ulong[] _bitset;
+        private int _bitsetWordCount;
         private static readonly ArrayPool<T> _compPool = ArrayPool<T>.Shared;
         private static readonly ArrayPool<int> _intPool = ArrayPool<int>.Shared;
 
@@ -39,12 +45,33 @@ namespace ECSEngine
         {
             get { return _count; }
         }
+        public ulong[] BitsetArray => _bitset;
+        public int BitsetWordCount => _bitsetWordCount;
+        internal int[] DenseEntities => _denseToEntity;
 
         public ComponentPool(int initialCapacity = 256)
         {
             _components = _compPool.Rent(initialCapacity);
             _entityToDense = _intPool.Rent(initialCapacity);
             _denseToEntity = _intPool.Rent(initialCapacity);
+
+            int words = (initialCapacity >> 6) + 1;
+            _bitset = _bitsetPool.Rent(words);
+            _bitsetWordCount = words;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void GrowBitset(int entityId)
+        {
+            int requiredWords = (entityId >> 6) + 1;
+            int newWords = Math.Max(requiredWords, _bitsetWordCount * 2);
+            var next = _bitsetPool.Rent(newWords);
+            Array.Copy(_bitset, next, _bitsetWordCount);
+
+            Array.Clear(next, _bitsetWordCount, newWords - _bitsetWordCount);
+            _bitsetPool.Return(_bitset, clearArray: false);
+            _bitset = next;
+            _bitsetWordCount = newWords;
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -85,6 +112,7 @@ namespace ECSEngine
                 _compPool.Return(_components, clearArray: _containsRefs);
                 _intPool.Return(_entityToDense, clearArray: false);
                 _intPool.Return(_denseToEntity, clearArray: false);
+                _bitsetPool.Return(_bitset, clearArray: false);
             }
             catch (Exception ex)
             {
@@ -104,6 +132,10 @@ namespace ECSEngine
             if (_count >= _components.Length)
                 GrowDense();
 
+            int word = entityId >> 6;
+            if (word >= _bitsetWordCount) GrowBitset(entityId);
+            _bitset[word] |= 1UL << (entityId & 63);
+
             _entityToDense[entityId] = _count;
             _denseToEntity[_count] = entityId;
             _components[_count] = component;
@@ -118,17 +150,21 @@ namespace ECSEngine
 
         public bool Has(int entityId)
         {
-            if ((uint)entityId >= (uint)_entityToDense.Length) return false;
-            int denseIndex = _entityToDense[entityId];
-            if (denseIndex < 0) return false;
-            return denseIndex < _count && _denseToEntity[denseIndex] == entityId;
+            //if ((uint)entityId >= (uint)_entityToDense.Length) return false;
+            //int denseIndex = _entityToDense[entityId];
+            //if (denseIndex < 0) return false;
+            //return denseIndex < _count && _denseToEntity[denseIndex] == entityId;
+            int word = entityId >> 6;
+            if ((uint)word >= (uint)_bitsetWordCount) return false;
+            return (_bitset[word] & (1UL << (entityId & 63))) != 0;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal bool HasUnsafe(int entityId)
         {
-            int denseIndex = _entityToDense[entityId];
-            return denseIndex < _count && _denseToEntity[denseIndex] == entityId;
+            //int denseIndex = _entityToDense[entityId];
+            //return denseIndex < _count && _denseToEntity[denseIndex] == entityId;
+            return (_bitset[entityId >> 6] & (1UL << (entityId & 63))) != 0;
         }
 
         public ReadOnlySpan<int> ActiveEntities => _denseToEntity.AsSpan(0, _count);
@@ -136,6 +172,8 @@ namespace ECSEngine
         public void Remove(int entityId)
         {
             if (!Has(entityId)) return;
+
+            _bitset[entityId >> 6] &= ~(1UL << (entityId & 63));
 
             int indexToRemove = _entityToDense[entityId];
             int lastIndex = _count - 1;
@@ -146,6 +184,7 @@ namespace ECSEngine
                 _components[indexToRemove] = _components[lastIndex];
                 _denseToEntity[indexToRemove] = lastEntityId;
                 _entityToDense[lastEntityId] = indexToRemove;
+                _bitsetPool.Return(_bitset, clearArray: false);
             }
 
             _entityToDense[entityId] = -1;
@@ -165,6 +204,13 @@ namespace ECSEngine
         public float DeltaTime;
         public long FrameCount;
         public EcsRegistry Registry;
+
+        public ParallelEcsContext AsParallel() => new()
+        {
+            DeltaTime = DeltaTime,
+            FrameCount = FrameCount,
+            _reg = Registry
+        };
     }
 
     /// <summary>

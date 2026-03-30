@@ -1,6 +1,7 @@
 ﻿using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace ECSEngine
 {
@@ -28,9 +29,16 @@ namespace ECSEngine
         public float Checksum<T>(Func<T, float> selector) where T : struct
         {
             var pool = GetPool<T>();
+            int count = pool.Count;
             float sum = 0;
-            foreach (int id in pool.ActiveEntities)
+            ref int entityRef = ref MemoryMarshal.GetReference(pool.ActiveEntities);
+
+            for (int i = 0; i < count; i++)
+            {
+                int id = Unsafe.Add(ref entityRef, i);
                 sum += selector(pool.Get(id));
+            }
+
             return sum;
         }
 
